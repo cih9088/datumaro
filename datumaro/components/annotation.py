@@ -4,10 +4,24 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from enum import IntEnum
-from functools import partial
+from functools import lru_cache, partial
 from itertools import zip_longest
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import attr
 import numpy as np
@@ -17,6 +31,9 @@ from typing_extensions import Literal
 
 from datumaro.components.media import Image
 from datumaro.util.attrs_util import default_if_none, not_empty
+
+
+TAnnotation = TypeVar("TAnnotation", bound="Annotation")
 
 
 class AnnotationType(IntEnum):
@@ -34,10 +51,25 @@ class AnnotationType(IntEnum):
     ellipse = 11
     hash_key = 12
 
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, str) and other in self.__class__._member_map_:
+            other = self.__class__._member_map_[other]
+        if isinstance(other, int) and other in self.__class__._value2member_map_:
+            other = self.__class__._value2member_map_[other]
+
+        if self.__class__ is other.__class__:
+            return self.value == other.value
+        else:
+            return False
+
+    def __hash__(self):
+        return id(self)
+
 
 COORDINATE_ROUNDING_DIGITS = 2
 CHECK_POLYGON_EQ_EPSILONE = 1e-7
 NO_GROUP = 0
+ANNOTATION_TYPE_KEY = "type"
 
 
 @attrs(slots=True, kw_only=True, order=False)
@@ -74,13 +106,38 @@ class Annotation:
     def type(self) -> AnnotationType:
         return self._type  # must be set in subclasses
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self, with_type: bool = False) -> Dict[str, Any]:
         "Returns a dictionary { field_name: value }"
-        return asdict(self)
+        attr_dict = asdict(self)
+        if with_type:
+            attr_dict.update({ANNOTATION_TYPE_KEY: self.__class__.__name__})
+        return attr_dict
 
     def wrap(self, **kwargs):
         "Returns a modified copy of the object"
         return attr.evolve(self, **kwargs)
+
+    @classmethod
+    @lru_cache
+    def _get_annotations(cls) -> Dict[str, Type["Annotation"]]:
+        map: Dict[str, Type["Annotation"]] = {cls.__name__: cls}
+        subclasses = cls.__subclasses__()
+        for subclass in subclasses:
+            if getattr(subclass, "_type", None):
+                map[subclass.__name__] = subclass
+            subclasses.extend(subclass.__subclasses__())
+        return map
+
+    @classmethod
+    def from_dict(cls: Type[TAnnotation], attr_dict: Dict[str, Any]) -> TAnnotation:
+        attr_dict = deepcopy(attr_dict)
+        anno_type = attr_dict.pop(ANNOTATION_TYPE_KEY, None)
+        if anno_type is None:
+            return cls(**attr_dict)
+        annos = cls._get_annotations()
+        if anno_type not in annos:
+            raise ValueError(f"Invalid type '{anno_type}'. Valid types are {list(annos.keys())}")
+        return annos[anno_type](**attr_dict)
 
 
 @attrs(slots=True, kw_only=True, order=False)
@@ -355,6 +412,11 @@ class Mask(Annotation):
             and (np.array_equal(self.image, other.image))
         )
 
+    def as_dict(self, with_type: bool = False) -> Dict[str, Any]:
+        attr_dict = super().as_dict(with_type)
+        attr_dict["image"] = attr_dict.pop("_image")
+        return attr_dict
+
 
 @attrs(slots=True, eq=False, order=False)
 class RleMask(Mask):
@@ -365,6 +427,12 @@ class RleMask(Mask):
     _rle = field()  # uses pycocotools RLE representation
 
     _image = field(init=False, default=None)
+
+    def __attrs_post_init__(self):
+        from datumaro.plugins.data_formats.coco.base import _CocoBase
+
+        if not isinstance(self._rle, _CocoBase._lazy_merged_mask):
+            self._rle = _CocoBase._lazy_merged_mask(**self._rle)
 
     @property
     def image(self) -> BinaryMaskImage:
@@ -397,6 +465,12 @@ class RleMask(Mask):
         if not isinstance(other, __class__):
             return super().__eq__(other)
         return self.rle == other.rle
+
+    def as_dict(self, with_type: bool = False) -> Dict[str, Any]:
+        attr_dict = super().as_dict(with_type)
+        attr_dict.pop("image", None)
+        attr_dict["rle"] = attr_dict.pop("_rle")
+        return attr_dict
 
 
 CompiledMaskImage = np.ndarray  # 2d of integers (of different precision)
@@ -657,6 +731,14 @@ class Cuboid3d(Annotation):
     def _set_scale(self, value):
         self.scale[:] = np.around(value, COORDINATE_ROUNDING_DIGITS).tolist()
 
+    def as_dict(self, with_type: bool = False) -> Dict[str, Any]:
+        attr_dict = super().as_dict(with_type)
+        attr_dict.pop("_points", None)
+        attr_dict["position"] = self.position
+        attr_dict["rotation"] = self.rotation
+        attr_dict["scale"] = self.scale
+        return attr_dict
+
 
 @attrs(slots=True, order=False, eq=False)
 class Polygon(_Shape):
@@ -735,9 +817,15 @@ class Bbox(_Shape):
         return bbox_iou(self.get_bbox(), other.get_bbox())
 
     def wrap(item, **kwargs):
-        d = {"x": item.x, "y": item.y, "w": item.w, "h": item.h}
-        d.update(kwargs)
-        return attr.evolve(item, **d)
+        attr_dict = {"x": item.x, "y": item.y, "w": item.w, "h": item.h}
+        attr_dict.update(kwargs)
+        return attr.evolve(item, **attr_dict)
+
+    def as_dict(self, with_type: bool = False) -> Dict[str, Any]:
+        attr_dict = super().as_dict(with_type)
+        attr_dict.pop("points", None)
+        attr_dict.update({"x": self.x, "y": self.y, "w": self.w, "h": self.h})
+        return attr_dict
 
 
 @attrs(slots=True, order=False)
@@ -1005,3 +1093,9 @@ class Ellipse(_Shape):
         d = {"x1": item.x1, "y1": item.y1, "x2": item.x2, "y2": item.y2}
         d.update(kwargs)
         return attr.evolve(item, **d)
+
+    def as_dict(self, with_type: bool = False) -> Dict[str, Any]:
+        attr_dict = super().as_dict(with_type)
+        attr_dict.pop("points", None)
+        attr_dict.update({"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2})
+        return attr_dict
