@@ -394,4 +394,4 @@ class ExportContextComponent:
 
     @property
     def source_path(self) -> str:
-        return self._source_path
+        return self._source_path if self._source_path else ""
